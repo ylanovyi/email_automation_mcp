@@ -5,11 +5,13 @@ import hashlib
 import hmac
 import html
 import imaplib
+import json
 import logging
 import os
 import re
 import secrets
 import sqlite3
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -17,12 +19,23 @@ from email import policy
 from email.header import decode_header
 from email.parser import BytesParser
 from typing import Any
+from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    RefreshToken,
+    TokenError,
+    construct_redirect_uri,
+)
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import PlainTextResponse
@@ -36,6 +49,10 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change-me")
 ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET", ADMIN_PASSWORD)
 DEFAULT_POLL_INTERVAL = max(10, int(os.getenv("POLL_INTERVAL_SECONDS", "60")))
 PORT = int(os.getenv("PORT", "8000"))
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", f"http://localhost:{PORT}").rstrip("/")
+MCP_ISSUER_URL = os.getenv("MCP_ISSUER_URL", PUBLIC_BASE_URL).rstrip("/")
+MCP_RESOURCE_URL = os.getenv("MCP_RESOURCE_URL", f"{PUBLIC_BASE_URL}/mcp").rstrip("/")
+MCP_SCOPE = os.getenv("MCP_SCOPE", "gmail:triage")
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(APP_NAME)
@@ -100,6 +117,44 @@ class Database:
                     level TEXT NOT NULL,
                     event TEXT NOT NULL,
                     detail TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS oauth_clients (
+                    client_id TEXT PRIMARY KEY,
+                    metadata TEXT NOT NULL,
+                    client_secret TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS oauth_pending (
+                    request_id TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    state TEXT,
+                    scopes TEXT NOT NULL,
+                    code_challenge TEXT NOT NULL,
+                    redirect_uri TEXT NOT NULL,
+                    redirect_uri_provided_explicitly INTEGER NOT NULL,
+                    resource TEXT,
+                    expires_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS oauth_codes (
+                    code TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    scopes TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    code_challenge TEXT NOT NULL,
+                    redirect_uri TEXT NOT NULL,
+                    redirect_uri_provided_explicitly INTEGER NOT NULL,
+                    resource TEXT,
+                    subject TEXT
+                );
+                CREATE TABLE IF NOT EXISTS oauth_tokens (
+                    token TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL CHECK(kind IN ('access','refresh')),
+                    client_id TEXT NOT NULL,
+                    scopes TEXT NOT NULL,
+                    expires_at REAL,
+                    resource TEXT,
+                    subject TEXT,
+                    revoked INTEGER NOT NULL DEFAULT 0
                 );
                 """
             )
@@ -261,6 +316,101 @@ class Database:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM activity_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
+    # OAuth state is kept in the same SQLite database as the queue. This makes
+    # the authorization code and registered client survive normal restarts on a
+    # host with persistent storage (such as the included Render disk).
+    def oauth_client(self, client_id: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM oauth_clients WHERE client_id=?", (client_id,)).fetchone()
+
+    def save_oauth_client(self, client: OAuthClientInformationFull) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO oauth_clients(client_id,metadata,client_secret,created_at)
+                   VALUES(?,?,?,?)""",
+                (client.client_id, client.model_dump_json(), client.client_secret, self.now()),
+            )
+
+    def oauth_pending(self, request_id: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM oauth_pending WHERE request_id=?", (request_id,)).fetchone()
+            if row and float(row["expires_at"]) < time.time():
+                conn.execute("DELETE FROM oauth_pending WHERE request_id=?", (request_id,))
+                return None
+            return row
+
+    def save_oauth_pending(self, request_id: str, client_id: str, params: AuthorizationParams) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO oauth_pending(request_id,client_id,state,scopes,code_challenge,redirect_uri,
+                   redirect_uri_provided_explicitly,resource,expires_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    request_id,
+                    client_id,
+                    params.state,
+                    json.dumps(params.scopes or []),
+                    params.code_challenge,
+                    str(params.redirect_uri),
+                    int(params.redirect_uri_provided_explicitly),
+                    params.resource,
+                    time.time() + 600,
+                ),
+            )
+
+    def delete_oauth_pending(self, request_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM oauth_pending WHERE request_id=?", (request_id,))
+
+    def save_oauth_code(self, code: AuthorizationCode) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO oauth_codes(code,client_id,scopes,expires_at,code_challenge,redirect_uri,
+                   redirect_uri_provided_explicitly,resource,subject) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    code.code,
+                    code.client_id,
+                    json.dumps(code.scopes),
+                    code.expires_at,
+                    code.code_challenge,
+                    str(code.redirect_uri),
+                    int(code.redirect_uri_provided_explicitly),
+                    code.resource,
+                    code.subject,
+                ),
+            )
+
+    def oauth_code(self, code: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM oauth_codes WHERE code=?", (code,)).fetchone()
+
+    def delete_oauth_code(self, code: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM oauth_codes WHERE code=?", (code,))
+
+    def save_oauth_token(self, token: str, kind: str, client_id: str, scopes: list[str], expires_at: float | None, resource: str | None, subject: str | None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO oauth_tokens(token,kind,client_id,scopes,expires_at,resource,subject)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (token, kind, client_id, json.dumps(scopes), expires_at, resource, subject),
+            )
+
+    def oauth_token(self, token: str, kind: str | None = None) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            query = "SELECT * FROM oauth_tokens WHERE token=? AND revoked=0"
+            params: list[Any] = [token]
+            if kind:
+                query += " AND kind=?"
+                params.append(kind)
+            row = conn.execute(query, params).fetchone()
+            if row and row["expires_at"] is not None and float(row["expires_at"]) < time.time():
+                return None
+            return row
+
+    def revoke_oauth_token(self, token: str) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE oauth_tokens SET revoked=1 WHERE token=?", (token,))
+
 
 db = Database(DB_PATH)
 
@@ -398,9 +548,159 @@ _transport_security = TransportSecuritySettings(
     allowed_origins=_allowed_origins,
 )
 
+
+class SQLiteOAuthProvider:
+    """Small OAuth 2.1 authorization server for a single-owner deployment.
+
+    ChatGPT opens the consent URL in the browser once per connection. The
+    resulting access and refresh tokens are stored in SQLite and verified by
+    the MCP SDK on every request. This is intentionally separate from the
+    static bearer token, which remains useful for direct integrations and
+    health checks.
+    """
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        row = db.oauth_client(client_id)
+        if not row:
+            return None
+        try:
+            return OAuthClientInformationFull.model_validate_json(row["metadata"])
+        except Exception:
+            return None
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        if not client_info.client_id:
+            raise ValueError("OAuth client id is required")
+        db.save_oauth_client(client_info)
+
+    async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
+        request_id = secrets.token_urlsafe(24)
+        db.save_oauth_pending(request_id, client.client_id or "", params)
+        return f"{PUBLIC_BASE_URL}/oauth/consent?request_id={quote(request_id)}"
+
+    async def complete_authorization(self, request_id: str, approved: bool) -> str:
+        row = db.oauth_pending(request_id)
+        if not row:
+            return f"{PUBLIC_BASE_URL}/oauth/consent?error=expired"
+        db.delete_oauth_pending(request_id)
+        redirect_uri = row["redirect_uri"]
+        state = row["state"]
+        if not approved:
+            return construct_redirect_uri(redirect_uri, error="access_denied", state=state)
+        code = secrets.token_urlsafe(32)
+        db.save_oauth_code(
+            AuthorizationCode(
+                code=code,
+                client_id=row["client_id"],
+                scopes=json.loads(row["scopes"]),
+                expires_at=time.time() + 300,
+                code_challenge=row["code_challenge"],
+                redirect_uri=redirect_uri,
+                redirect_uri_provided_explicitly=bool(row["redirect_uri_provided_explicitly"]),
+                resource=row["resource"] or MCP_RESOURCE_URL,
+                subject="owner",
+            )
+        )
+        return construct_redirect_uri(redirect_uri, code=code, state=state)
+
+    async def load_authorization_code(self, client: OAuthClientInformationFull, authorization_code: str) -> AuthorizationCode | None:
+        row = db.oauth_code(authorization_code)
+        if not row or row["client_id"] != client.client_id or float(row["expires_at"]) < time.time():
+            return None
+        return AuthorizationCode(
+            code=row["code"],
+            client_id=row["client_id"],
+            scopes=json.loads(row["scopes"]),
+            expires_at=float(row["expires_at"]),
+            code_challenge=row["code_challenge"],
+            redirect_uri=row["redirect_uri"],
+            redirect_uri_provided_explicitly=bool(row["redirect_uri_provided_explicitly"]),
+            resource=row["resource"] or MCP_RESOURCE_URL,
+            subject=row["subject"],
+        )
+
+    async def exchange_authorization_code(self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode) -> OAuthToken:
+        db.delete_oauth_code(authorization_code.code)
+        access_token = secrets.token_urlsafe(32)
+        refresh_token = secrets.token_urlsafe(32)
+        expires_in = 3600
+        resource = authorization_code.resource or MCP_RESOURCE_URL
+        db.save_oauth_token(access_token, "access", client.client_id or "", authorization_code.scopes, time.time() + expires_in, resource, authorization_code.subject)
+        db.save_oauth_token(refresh_token, "refresh", client.client_id or "", authorization_code.scopes, None, resource, authorization_code.subject)
+        return OAuthToken(
+            access_token=access_token,
+            expires_in=expires_in,
+            scope=" ".join(authorization_code.scopes),
+            refresh_token=refresh_token,
+        )
+
+    async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
+        row = db.oauth_token(refresh_token, "refresh")
+        if not row or row["client_id"] != client.client_id:
+            return None
+        return RefreshToken(
+            token=row["token"],
+            client_id=row["client_id"],
+            scopes=json.loads(row["scopes"]),
+            expires_at=int(row["expires_at"]) if row["expires_at"] is not None else None,
+            resource=row["resource"] or MCP_RESOURCE_URL,
+            subject=row["subject"],
+        )
+
+    async def exchange_refresh_token(self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]) -> OAuthToken:
+        db.revoke_oauth_token(refresh_token.token)
+        access_token = secrets.token_urlsafe(32)
+        replacement_refresh = secrets.token_urlsafe(32)
+        expires_in = 3600
+        resource = refresh_token.resource or MCP_RESOURCE_URL
+        db.save_oauth_token(access_token, "access", client.client_id or "", scopes, time.time() + expires_in, resource, refresh_token.subject)
+        db.save_oauth_token(replacement_refresh, "refresh", client.client_id or "", scopes, None, resource, refresh_token.subject)
+        return OAuthToken(access_token=access_token, expires_in=expires_in, scope=" ".join(scopes), refresh_token=replacement_refresh)
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        if MCP_BEARER_TOKEN and hmac.compare_digest(token, MCP_BEARER_TOKEN):
+            return AccessToken(token=token, client_id="static", scopes=[MCP_SCOPE], resource=MCP_RESOURCE_URL)
+        row = db.oauth_token(token, "access")
+        if not row:
+            return None
+        return AccessToken(
+            token=row["token"],
+            client_id=row["client_id"],
+            scopes=json.loads(row["scopes"]),
+            expires_at=int(row["expires_at"]) if row["expires_at"] is not None else None,
+            resource=row["resource"] or MCP_RESOURCE_URL,
+            subject=row["subject"],
+        )
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        db.revoke_oauth_token(token.token)
+
+
+class CombinedTokenVerifier:
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if MCP_BEARER_TOKEN and hmac.compare_digest(token, MCP_BEARER_TOKEN):
+            return AccessToken(token=token, client_id="static", scopes=[MCP_SCOPE], resource=MCP_RESOURCE_URL)
+        return await oauth_provider.load_access_token(token)
+
+
+oauth_provider = SQLiteOAuthProvider()
+auth_settings = AuthSettings(
+    issuer_url=MCP_ISSUER_URL,
+    resource_server_url=MCP_RESOURCE_URL,
+    validate_token_resource=True,
+    required_scopes=[MCP_SCOPE],
+    client_registration_options=ClientRegistrationOptions(
+        enabled=True,
+        valid_scopes=[MCP_SCOPE],
+        default_scopes=[MCP_SCOPE],
+    ),
+)
+
 mcp = FastMCP(
     APP_NAME,
     instructions="Gmail inbox triage queue. Use get_instructions before processing mail.",
+    auth_server_provider=oauth_provider,
+    auth=auth_settings,
     streamable_http_path="/mcp",
     json_response=True,
     stateless_http=True,
@@ -556,8 +856,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
-# The FastMCP app owns the /mcp route. Mounting it at the root keeps the
-# public endpoint exactly /mcp (without a redirect to /mcp/).
+# The FastMCP app owns the /mcp route and the OAuth discovery/authorization
+# endpoints. Mounting it at the root keeps the public endpoint exactly /mcp.
 mcp_app = mcp.streamable_http_app()
 
 
@@ -650,8 +950,54 @@ async def healthz():
     return PlainTextResponse("ok")
 
 
-# Mount after the UI routes so the root dashboard remains reachable.
-app.mount("/", BearerMiddleware(mcp_app))
+@app.get("/.well-known/oauth-authorization-server")
+async def oauth_authorization_server_metadata():
+    """Advertise OAuth methods accepted by the built-in MCP authorization server.
+
+    The SDK's default metadata predates ChatGPT's public-client preference and
+    omits ``none``. Keeping this small response explicit lets ChatGPT use DCR
+    with PKCE while the SDK continues to handle the protocol endpoints.
+    """
+    return JSONResponse(
+        {
+            "issuer": MCP_ISSUER_URL,
+            "authorization_endpoint": f"{MCP_ISSUER_URL}/authorize",
+            "token_endpoint": f"{MCP_ISSUER_URL}/token",
+            "registration_endpoint": f"{MCP_ISSUER_URL}/register",
+            "scopes_supported": [MCP_SCOPE],
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
+            "code_challenge_methods_supported": ["S256"],
+            "service_documentation": PUBLIC_BASE_URL,
+        }
+    )
+
+
+@app.get("/oauth/consent", response_class=HTMLResponse)
+async def oauth_consent(request_id: str | None = None, error: str | None = None):
+    if error:
+        return HTMLResponse("<h1>Authorization expired</h1><p>Please return to ChatGPT and reconnect.</p>", status_code=400)
+    if not request_id or not db.oauth_pending(request_id):
+        return HTMLResponse("<h1>Authorization request expired</h1><p>Please return to ChatGPT and reconnect.</p>", status_code=400)
+    return HTMLResponse(
+        """<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
+        <title>Authorize Gmail Inbox Triage</title><style>body{font:16px system-ui;display:grid;place-items:center;min-height:100vh;background:#f6f8fa}main{background:#fff;padding:2rem;border-radius:12px;box-shadow:0 8px 30px #0001;max-width:440px}button{font:inherit;padding:.7rem 1rem;border:0;border-radius:6px;margin:.4rem .2rem;cursor:pointer}.yes{background:#1f6feb;color:#fff}.no{background:#e5e7eb}</style></head>
+        <body><main><h1>Authorize Gmail Inbox Triage</h1><p>ChatGPT is requesting access to read and process the queued Gmail messages in this service.</p>
+        <form method='post' action='/oauth/consent'><input type='hidden' name='request_id' value='""" + html.escape(request_id) + """'><button class='yes' name='decision' value='approve'>Approve</button><button class='no' name='decision' value='deny'>Deny</button></form></main></body></html>"""
+    )
+
+
+@app.post("/oauth/consent")
+async def oauth_consent_submit(request_id: str = Form(...), decision: str = Form("deny")):
+    redirect_url = await oauth_provider.complete_authorization(request_id, decision == "approve")
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+# Mount after the UI and consent routes so the dashboard, OAuth approval page,
+# and metadata remain reachable without a bearer token. The MCP SDK's auth
+# middleware protects /mcp and returns the OAuth discovery challenge.
+app.mount("/", mcp_app)
 
 
 if __name__ == "__main__":
