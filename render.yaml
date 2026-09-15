@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: gmail-triage-mcp
+    runtime: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /healthz
+    disk:
+      name: gmail-triage-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: MCP_BEARER_TOKEN
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_SESSION_SECRET
+        sync: false
+      - key: DATABASE_PATH
+        value: /app/data/app.db
+      - key: POLL_INTERVAL_SECONDS
+        value: "60"
+      - key: COOKIE_SECURE
+        value: "true"
